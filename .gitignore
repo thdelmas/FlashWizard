@@ -1,0 +1,20 @@
+# Don't commit downloaded firmware/ROM artifacts
+SM-T805-factory-firmware/
+SM-T805-Lineage-Chagalllte/
+*firmware*/
+*Firmware*/
+
+# Common flashing artifacts
+*.tar.md5
+*.pit
+*.img
+*.img.tar
+*.bin
+*.lz4
+
+# ROM downloads
+*.zip
+
+# OS cruft
+.DS_Store
+
