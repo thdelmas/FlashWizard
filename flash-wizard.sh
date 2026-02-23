@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+#
+# flash-wizard.sh
+# Interactive helper for flashing Samsung devices (Heimdall) and
+# installing custom ROM / GApps via adb sideload.
+#
+# It does NOT hard‑code any particular model. You provide:
+# - Firmware zip path (for stock restore)
+# - Recovery .img path (for TWRP/other)
+# - ROM / GApps zip path (for adb sideload)
+#
+# The script guides you through:
+# - Required physical steps (Download Mode, Recovery, ADB sideload)
+# - Confirming commands before they run
+#
+
+set -euo pipefail
+
+########################################
+# Utility helpers
+########################################
+
+prompt() {
+  local msg=$1
+  read -r -p "$msg" REPLY
+  printf '%s\n' "$REPLY"
+}
+
+confirm() {
+  local msg=$1
+  read -r -p "$msg [y/N]: " REPLY
+  case "$REPLY" in
+    [Yy]*) return 0 ;;
+    *)     return 1 ;;
+  esac
+}
+
+require_cmd() {
+  local cmd=$1
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "ERROR: '$cmd' is not installed or not in PATH."
+    if [[ "$cmd" == "heimdall" ]]; then
+      echo "Install with:  sudo apt update && sudo apt install heimdall-flash"
+    elif [[ "$cmd" == "adb" ]]; then
+      echo "Install with:  sudo apt update && sudo apt install adb"
+    fi
+    exit 1
+  fi
+}
+
+########################################
+# Heimdall / Samsung helpers
+########################################
+
+check_heimdall_device() {
+  echo
+  echo "== Checking Heimdall device detection (with sudo) =="
+  if ! sudo heimdall detect; then
+    echo "ERROR: Heimdall could not detect a download‑mode device."
+    echo "Make sure the device is in DOWNLOAD MODE and connected via USB."
+    echo "For Samsung: Power + Home + Volume Down, then Volume Up to confirm."
+    exit 1
+  fi
+}
+
+flash_stock_firmware() {
+  echo "== Stock firmware restore (Samsung / Heimdall) =="
+  echo
+  echo "This expects a Samsung firmware ZIP containing BL/AP/CP/CSC *.tar.md5 files."
+  echo "Example: SAMFW.COM_SM-XXXX_... .zip or SamMobile/SamFrew firmware."
+  echo
+
+  local default_fw_zip="$HOME/Downloads"
+  echo "Enter path to firmware ZIP (or leave empty to browse $default_fw_zip):"
+  read -r FW_ZIP
+
+  if [[ -z "$FW_ZIP" ]]; then
+    echo "Listing *.zip in $default_fw_zip:"
+    ls -1 "$default_fw_zip"/*.zip 2>/dev/null || true
+    FW_ZIP=$(prompt "Type the full path to the firmware ZIP: ")
+  fi
+
+  if [[ ! -f "$FW_ZIP" ]]; then
+    echo "ERROR: Firmware zip not found at: $FW_ZIP"
+    exit 1
+  fi
+
+  local base
+  base=$(basename "$FW_ZIP")
+  local WORK_DIR="$HOME/Downloads/${base%.zip}-unpacked"
+
+  echo
+  echo "Using firmware zip: $FW_ZIP"
+  echo "Working directory:  $WORK_DIR"
+  mkdir -p "$WORK_DIR"
+
+  echo
+  echo "== Extracting main firmware zip =="
+  unzip -o "$FW_ZIP" -d "$WORK_DIR"
+
+  cd "$WORK_DIR"
+
+  echo
+  echo "== Extracting BL/AP/CP/CSC tar.md5 files (if present) =="
+  shopt -s nullglob
+  for part in BL_*.tar.md5 AP_*.tar.md5 CP_*.tar.md5 CSC_*.tar.md5; do
+    if [[ -f "$part" ]]; then
+      echo "Extracting $part"
+      tar -xvf "$part"
+    fi
+  done
+  shopt -u nullglob
+
+  echo
+  echo "Files in firmware directory:"
+  ls
+
+  # Try to detect common image filenames.
+  local BOOT="" RECOVERY="" SYSTEM="" MODEM="" CACHE="" HIDDEN="" USERDATA=""
+
+  [[ -f boot.img ]] && BOOT="boot.img"
+  [[ -f recovery.img ]] && RECOVERY="recovery.img"
+  # Prefer plain system.img; fall back to first matching system*.img*
+  if [[ -f system.img ]]; then
+    SYSTEM="system.img"
+  else
+    SYSTEM=$(ls system*.img* 2>/dev/null | head -n 1 || true)
+  fi
+  [[ -f modem.bin ]] && MODEM="modem.bin"
+  [[ -f NON-HLOS.bin ]] && MODEM=${MODEM:-"NON-HLOS.bin"}
+  if [[ -f cache.img ]]; then
+    CACHE="cache.img"
+  else
+    CACHE=$(ls cache*.img* 2>/dev/null | head -n 1 || true)
+  fi
+  if [[ -f hidden.img ]]; then
+    HIDDEN="hidden.img"
+  else
+    HIDDEN=$(ls hidden*.img* 2>/dev/null | head -n 1 || true)
+  fi
+  if [[ -f userdata.img ]]; then
+    USERDATA="userdata.img"
+  else
+    USERDATA=$(ls user*.img* 2>/dev/null | head -n 1 || true)
+  fi
+
+  echo
+  echo "Detected images (empty means not found):"
+  echo "  BOOT:     ${BOOT:-<none>}"
+  echo "  RECOVERY: ${RECOVERY:-<none>}"
+  echo "  SYSTEM:   ${SYSTEM:-<none>}"
+  echo "  MODEM:    ${MODEM:-<none>}"
+  echo "  CACHE:    ${CACHE:-<none>}"
+  echo "  HIDDEN:   ${HIDDEN:-<none>}"
+  echo "  USERDATA: ${USERDATA:-<none>}"
+
+  echo
+  echo "== IMPORTANT =="
+  echo "1) Put the device into DOWNLOAD MODE now."
+  echo "   For Samsung: Power + Home + Volume Down, then Volume Up to confirm."
+  echo "2) Connect it to this computer via USB."
+  echo
+  prompt "When the device is in Download Mode and plugged in, press Enter to continue..."
+
+  check_heimdall_device
+
+  echo
+  echo "By default, we will flash the minimal safe set: BOOT, RECOVERY, SYSTEM."
+  echo "You can choose to also include MODEM, CACHE, HIDDEN, USERDATA if they exist."
+
+  local HEIMDALL_CMD=(sudo heimdall flash)
+
+  if [[ -n "$BOOT" ]]; then
+    HEIMDALL_CMD+=(--BOOT "$BOOT")
+  fi
+  if [[ -n "$RECOVERY" ]]; then
+    HEIMDALL_CMD+=(--RECOVERY "$RECOVERY")
+  fi
+  if [[ -n "$SYSTEM" ]]; then
+    HEIMDALL_CMD+=(--SYSTEM "$SYSTEM")
+  fi
+
+  if [[ -n "$MODEM" ]] && confirm "Include MODEM ($MODEM) as well?"; then
+    HEIMDALL_CMD+=(--MODEM "$MODEM")
+  fi
+  if [[ -n "$CACHE" ]] && confirm "Include CACHE ($CACHE) as well?"; then
+    HEIMDALL_CMD+=(--CACHE "$CACHE")
+  fi
+  if [[ -n "$HIDDEN" ]] && confirm "Include HIDDEN ($HIDDEN) as well?"; then
+    HEIMDALL_CMD+=(--HIDDEN "$HIDDEN")
+  fi
+  if [[ -n "$USERDATA" ]] && confirm "Include USERDATA ($USERDATA) as well? (this may wipe data)"; then
+    HEIMDALL_CMD+=(--USERDATA "$USERDATA")
+  fi
+
+  echo
+  echo "About to run this Heimdall command:"
+  echo "  ${HEIMDALL_CMD[*]}"
+  echo
+  if ! confirm "Proceed with flashing?"; then
+    echo "Aborted by user."
+    exit 0
+  fi
+
+  "${HEIMDALL_CMD[@]}"
+
+  echo
+  echo "== Flash complete (if no errors were shown) =="
+  echo "If the device doesn't reboot automatically, hold the Power key combo to restart."
+  echo "Then boot into STOCK RECOVERY and perform:"
+  echo "  - Wipe data/factory reset"
+  echo "  - Wipe cache/dalvik (if available)"
+  echo "  - Reboot system now"
+}
+
+flash_custom_recovery() {
+  echo "== Flash custom recovery (Samsung / Heimdall) =="
+  echo
+
+  local RECOVERY_IMG
+  RECOVERY_IMG=$(prompt "Enter path to recovery .img (e.g. TWRP): ")
+
+  if [[ ! -f "$RECOVERY_IMG" ]]; then
+    echo "ERROR: Recovery image not found at: $RECOVERY_IMG"
+    exit 1
+  fi
+
+  echo
+  echo "Make sure the device is in DOWNLOAD MODE and connected via USB."
+  echo "For Samsung: Power + Home + Volume Down, then Volume Up to confirm."
+  echo
+  prompt "Press Enter once the device is in Download Mode..."
+
+  check_heimdall_device
+
+  echo
+  echo "Heimdall command to be executed:"
+  echo "  sudo heimdall flash --RECOVERY \"$RECOVERY_IMG\" --no-reboot"
+  echo
+  if ! confirm "Proceed with flashing recovery?"; then
+    echo "Aborted by user."
+    exit 0
+  fi
+
+  sudo heimdall flash --RECOVERY "$RECOVERY_IMG" --no-reboot
+
+  echo
+  echo "Recovery flashed. Now:"
+  echo "  1) Hold the appropriate key combo to exit Download Mode;"
+  echo "  2) Immediately boot into the new recovery (e.g. Power + Home + VolUp on Samsung)."
+}
+
+########################################
+# ADB sideload helpers (ROM / GApps)
+########################################
+
+ensure_adb_device_sideload() {
+  echo
+  echo "== Checking adb devices (sideload mode) =="
+  adb devices
+  echo
+  echo "If you do NOT see a 'sideload' device above:"
+  echo "  - On the device, in recovery, go to: Advanced -> ADB Sideload -> Swipe to start."
+  echo "  - Then run this script option again."
+}
+
+adb_sideload_zip() {
+  local label="$1"
+  echo "== ADB sideload: $label =="
+  echo
+
+  local ZIP_PATH
+  ZIP_PATH=$(prompt "Enter path to the $label zip: ")
+  if [[ ! -f "$ZIP_PATH" ]]; then
+    echo "ERROR: Zip not found at: $ZIP_PATH"
+    exit 1
+  fi
+
+  echo
+  echo "On the device, in recovery:"
+  echo "  - Go to: Advanced -> ADB Sideload"
+  echo "  - Swipe to start sideload"
+  echo
+  prompt "When the device is in ADB sideload mode, press Enter to continue..."
+
+  ensure_adb_device_sideload
+
+  echo
+  echo "About to run: adb sideload \"$ZIP_PATH\""
+  echo
+  if ! confirm "Proceed with adb sideload?"; then
+    echo "Aborted by user."
+    exit 0
+  fi
+
+  adb sideload "$ZIP_PATH"
+
+  echo
+  echo "$label sideload complete (if no errors were shown)."
+  echo "You can now reboot system from recovery."
+}
+
+########################################
+# Main menu
+########################################
+
+main_menu() {
+  require_cmd heimdall
+  require_cmd adb
+
+  echo "========================================"
+  echo "  Flash Wizard (Samsung / Heimdall & adb)"
+  echo "========================================"
+  echo "This script can help you:"
+  echo "  1) Restore stock firmware from a Samsung ZIP"
+  echo "  2) Flash a custom recovery .img (TWRP, etc.)"
+  echo "  3) Sideload a custom ROM zip via adb"
+  echo "  4) Sideload GApps or other zips via adb"
+  echo
+
+  local choice
+  choice=$(prompt "Choose an action (1-4, or anything else to quit): ")
+  case "$choice" in
+    1) flash_stock_firmware ;;
+    2) flash_custom_recovery ;;
+    3) adb_sideload_zip "custom ROM" ;;
+    4) adb_sideload_zip "GApps/other package" ;;
+    *) echo "Exiting."; exit 0 ;;
+  esac
+}
+
+main_menu
+
